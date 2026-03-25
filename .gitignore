@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+keepa_session.json
+keepa_downloads/
+.claude/
