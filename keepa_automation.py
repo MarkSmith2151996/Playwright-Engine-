@@ -1,16 +1,23 @@
 """
-Keepa Product Finder — Playwright Automation
+Keepa Automation — Playwright Engine
 
-Bulletproof extraction of full result sets from Keepa Product Finder.
-Primary method: Keepa's own CSV export (bypasses pagination).
-Fallback: ag-Grid API extraction with full pagination support.
-Last resort: DOM scraping with scroll.
+Full extraction from Keepa Product Finder and Seller Storefront pages.
+Three-tier strategy: Keepa CSV export → ag-Grid API → DOM scroll.
 
-Usage:
+Public API:
     ka = KeepaAutomation(headless=False)
     await ka.setup()
     await ka.login()
-    products = await ka.search(seller_ids=['A1GD4LR25P9QFR'])
+
+    # Product Finder: search by seller IDs + filters
+    products = await ka.search(seller_ids=['A3P5ROKL5A1OLE'], price_min=15, bsr_max=100000)
+
+    # Seller Storefront: get a seller's full catalog (~9s per seller)
+    catalog = await ka.seller_lookup('AVFHERP2L596L')
+
+    # Batch seller lookups with rate limiting
+    catalogs = await ka.seller_lookup_batch(['SELLER1', 'SELLER2'], delay_between=10)
+
     await ka.close()
 """
 
@@ -35,6 +42,7 @@ class KeepaAutomation:
     """Reliable Keepa Product Finder automation with full result extraction."""
 
     KEEPA_FINDER_URL = "https://keepa.com/#!finder"
+    KEEPA_SELLER_LOOKUP_URL = "https://keepa.com/#!sellerlookup"
 
     def __init__(self, headless: bool = False, download_dir: str | None = None):
         self.headless = headless
@@ -350,77 +358,101 @@ class KeepaAutomation:
 
     async def _set_page_size_max(self):
         """
-        Change the grid's "100 rows" page size to 5000 (the maximum).
-
-        Keepa toolbar structure:
-          <span class="tool__row mdc-menu-anchor">
-            <span class="trigger">"100 rows"</span>   ← click this
-            <div class="mdc-menu">                     ← dropdown appears
-              <li>5</li><li>20</li>...<li>5000</li>    ← click 5000
-            </div>
-          </span>
+        Change the grid's page size to max (5000) if needed.
+        Skips if all results already fit in the current page size.
+        Works on both Product Finder and Storefront pages.
         """
         page = self.page
 
-        # Click the "rows" trigger in the toolbar
+        # Check if we even need to resize
+        info = await page.evaluate("""
+            () => {
+                let pageSize = 0;
+                const trigger = document.querySelector('.tool__row .trigger');
+                if (trigger) {
+                    const m = trigger.textContent.match(/(\\d+)/);
+                    if (m) pageSize = parseInt(m[1], 10);
+                }
+                let total = 0;
+                // Product Finder: .tool__results "total result of X"
+                const tr = document.querySelector('.tool__results');
+                if (tr) {
+                    const tm = tr.textContent.match(/total\\s+result\\s+of\\s+([\\d,]+)/i);
+                    if (tm) total = parseInt(tm[1].replace(/,/g, ''), 10);
+                    if (!total) {
+                        const nm = tr.textContent.match(/Number\\s+of\\s+results:\\s*([\\d,]+)/i);
+                        if (nm) total = parseInt(nm[1].replace(/,/g, ''), 10);
+                    }
+                }
+                // Storefront: "X to Y of Z"
+                if (!total) {
+                    const els = document.querySelectorAll('span, div');
+                    for (const el of els) {
+                        const m = el.textContent.trim().match(/^(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)$/);
+                        if (m) { total = parseInt(m[3].replace(/,/g, ''), 10); break; }
+                    }
+                }
+                return { pageSize, total };
+            }
+        """)
+
+        ps = info.get("pageSize", 0)
+        total = info.get("total", 0)
+        if total > 0 and total <= ps:
+            logger.info("All %d results fit in current page (%d rows) — skip resize", total, ps)
+            return True
+
+        # Need to increase — click the trigger
         trigger = await page.query_selector(".tool__row .trigger")
         if not trigger:
-            logger.warning("Could not find rows-per-page trigger (.tool__row .trigger)")
+            logger.warning("Could not find rows-per-page trigger")
             return False
 
         await trigger.click()
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
-        # The MDC menu is now open — find and click "5000"
         selected = await page.evaluate("""
             () => {
-                // MDC menu items inside .tool__row
                 const menu = document.querySelector('.tool__row .mdc-menu');
                 if (!menu) return 0;
                 const items = menu.querySelectorAll('li, .mdc-list-item');
                 for (const item of items) {
-                    const text = item.textContent.trim();
-                    if (text === '5000') {
-                        item.click();
-                        return 5000;
-                    }
+                    if (item.textContent.trim() === '5000') { item.click(); return 5000; }
                 }
-                // Fallback: click the last (largest) option
-                const allItems = [...items].filter(i => /^\\d+$/.test(i.textContent.trim()));
-                if (allItems.length > 0) {
-                    const last = allItems[allItems.length - 1];
-                    last.click();
-                    return parseInt(last.textContent.trim(), 10);
-                }
+                const nums = [...items].filter(i => /^\\d+$/.test(i.textContent.trim()));
+                if (nums.length) { const l = nums[nums.length-1]; l.click(); return parseInt(l.textContent.trim(), 10); }
                 return 0;
             }
         """)
 
         if selected > 0:
             logger.info("Set page size to %d rows", selected)
-            # Wait for the toolbar "Number of results" to update.
-            # When it shows more than 100 (e.g. "2,805"), the grid has reloaded.
-            # ag-Grid virtualizes so visible .ag-row count stays ~30 regardless.
-            for i in range(30):
-                result_text = await page.evaluate("""
+            for _ in range(20):
+                loaded = await page.evaluate("""
                     () => {
-                        const el = document.querySelector('.tool__results');
-                        return el ? el.textContent : '';
+                        // Product Finder
+                        const tr = document.querySelector('.tool__results');
+                        if (tr) {
+                            const m = tr.textContent.match(/Number\\s+of\\s+results:\\s*([\\d,]+)/i);
+                            if (m && parseInt(m[1].replace(/,/g, ''), 10) > 100) return true;
+                        }
+                        // Storefront: "X to Y of Z" with Y > 100
+                        const els = document.querySelectorAll('span, div');
+                        for (const el of els) {
+                            const m = el.textContent.trim().match(/^(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)$/);
+                            if (m && parseInt(m[2], 10) > 100) return true;
+                        }
+                        return false;
                     }
                 """)
-                # "Number of results: 2,805 (out of a total result of 2,805)"
-                m = re.search(r'Number of results:\s*([\d,]+)', result_text)
-                if m:
-                    displayed = int(m.group(1).replace(',', ''))
-                    if displayed > 100:
-                        logger.info("Grid loaded — showing %d results", displayed)
-                        break
+                if loaded:
+                    break
                 await asyncio.sleep(1)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             return True
-        else:
-            logger.warning("Could not select a larger page size")
-            return False
+
+        logger.warning("Could not select a larger page size")
+        return False
 
     async def _extract_via_export(self) -> list[dict] | None:
         """
@@ -886,7 +918,173 @@ class KeepaAutomation:
         return await self._download_via_playwright(export_confirm.click())
 
     # ------------------------------------------------------------------ #
-    #  9. CLEANUP                                                         #
+    #  9. SELLER LOOKUP — Navigate seller storefront & extract catalog    #
+    # ------------------------------------------------------------------ #
+
+    async def _navigate_seller_storefront(self, seller_id: str, marketplace: int = 1):
+        """
+        Navigate directly to a seller's storefront on Keepa.
+
+        Goes straight to keepa.com/#!seller/{marketplace}-{seller_id},
+        clicks STOREFRONT tab, waits for data.
+
+        Args:
+            seller_id: Amazon Seller ID (e.g. 'AVFHERP2L596L')
+            marketplace: Keepa marketplace ID (1 = Amazon.com)
+        """
+        page = self.page
+
+        # Navigate directly to seller page — skip the lookup form entirely
+        url = f"https://keepa.com/#!seller/{marketplace}-{seller_id}"
+        await page.goto(url, wait_until="domcontentloaded")
+        await asyncio.sleep(1)
+        logger.info("Navigated to seller page: %s", url)
+
+        # Step 4: Click the STOREFRONT tab
+        storefront_tab = await page.evaluate_handle("""
+            () => {
+                const els = document.querySelectorAll('a, button, span, div, [role="tab"]');
+                for (const el of els) {
+                    if (/^\\s*STOREFRONT\\s*$/i.test(el.textContent.trim())) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.height > 0 && rect.width > 0) return el;
+                    }
+                }
+                return null;
+            }
+        """)
+        is_null = await page.evaluate("el => el === null", storefront_tab)
+        if is_null:
+            await page.screenshot(path=os.path.join(self.download_dir, "debug_no_storefront_tab.png"))
+            raise RuntimeError("Could not find STOREFRONT tab")
+
+        await storefront_tab.click()
+        logger.info("Clicked STOREFRONT tab")
+
+        # Step 5: Wait for storefront data to finish loading
+        # The loading indicator shows a percentage (e.g., "81%", "79 / 98")
+        # Wait for the ag-Grid to appear and data to stabilize
+        await self._wait_for_storefront_load()
+
+    async def _wait_for_storefront_load(self, timeout: int = 90):
+        """
+        Wait for the storefront table to finish loading.
+
+        Checks for:
+          1. Pagination text "X to Y of Z" anywhere on page (Z > 0)
+          2. Visible ag-row elements with stable count
+          3. Loading percentage indicators (for progress logging)
+        """
+        page = self.page
+        start = time.time()
+        prev_row_count = 0
+        stable_ticks = 0
+
+        logger.info("Waiting for storefront data to load...")
+        while time.time() - start < timeout:
+            # Check 1: Any text matching "X to Y of Z" with Z > 0
+            total = await page.evaluate("""
+                () => {
+                    const els = document.querySelectorAll('span, div, td, .ag-paging-row-summary-panel');
+                    for (const el of els) {
+                        const t = el.textContent.trim();
+                        const m = t.match(/^(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+([\\d,]+)$/);
+                        if (m) {
+                            const total = parseInt(m[3].replace(/,/g, ''), 10);
+                            if (total > 0) return total;
+                        }
+                    }
+                    return 0;
+                }
+            """)
+            if total > 0:
+                logger.info("Storefront loaded: %d products", total)
+                await asyncio.sleep(1)
+                return total
+
+            # Check 2: ag-row elements visible and stable
+            row_count = await page.evaluate(
+                "() => document.querySelectorAll('.ag-row').length"
+            )
+            if row_count > 0 and row_count == prev_row_count:
+                stable_ticks += 1
+                if stable_ticks >= 3:
+                    logger.info("Storefront loaded: %d rows visible (stable)", row_count)
+                    await asyncio.sleep(1)
+                    return row_count
+            else:
+                stable_ticks = 0
+            prev_row_count = row_count
+
+            await asyncio.sleep(2)
+
+        await page.screenshot(path=os.path.join(self.download_dir, "debug_storefront_load_timeout.png"))
+        logger.warning("Storefront load timed out after %ds", timeout)
+        return 0
+
+    async def seller_lookup(self, seller_id: str) -> list[dict]:
+        """
+        Look up a seller on Keepa and extract their full storefront catalog.
+
+        Args:
+            seller_id: Amazon Seller ID (9-21 uppercase alphanumeric chars)
+
+        Returns:
+            List of product dicts from the seller's storefront.
+        """
+        await self._navigate_seller_storefront(seller_id)
+        return await self._extract_all()
+
+    async def seller_lookup_batch(
+        self,
+        seller_ids: list[str],
+        delay_between: int = 15,
+        max_retries: int = 1,
+    ) -> dict[str, list[dict]]:
+        """
+        Look up multiple sellers and extract their storefront catalogs.
+
+        Args:
+            seller_ids: List of Amazon Seller IDs
+            delay_between: Seconds to wait between seller lookups
+            max_retries: Number of retries per seller on failure
+
+        Returns:
+            Dict mapping seller_id → list of product dicts.
+            Failed lookups map to an empty list.
+        """
+        results = {}
+
+        for i, sid in enumerate(seller_ids):
+            logger.info("--- Seller %d/%d: %s ---", i + 1, len(seller_ids), sid)
+
+            for attempt in range(max_retries + 1):
+                try:
+                    products = await self.seller_lookup(sid)
+                    results[sid] = products
+                    logger.info("  Seller %s: %d products", sid, len(products))
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        wait = delay_between * 2
+                        logger.warning("  Seller %s attempt %d failed: %s — retrying in %ds",
+                                       sid, attempt + 1, e, wait)
+                        await asyncio.sleep(wait)
+                        await self.page.reload(wait_until="domcontentloaded")
+                        await asyncio.sleep(5)
+                    else:
+                        logger.error("  Seller %s FAILED after %d retries: %s", sid, max_retries, e)
+                        results[sid] = []
+
+            # Delay between lookups (skip after last)
+            if i < len(seller_ids) - 1:
+                logger.info("  Waiting %ds before next seller...", delay_between)
+                await asyncio.sleep(delay_between)
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  10. CLEANUP                                                        #
     # ------------------------------------------------------------------ #
 
     async def close(self):

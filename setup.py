@@ -14,11 +14,12 @@ setup(
     name="keepa-automation",
     version="1.0.0",
     description="Keepa Product Finder Playwright automation — full result extraction",
-    py_modules=["keepa_automation"],
+    py_modules=["keepa_automation", "supplier_research"],
     install_requires=[
         "playwright>=1.40.0",
         "playwright-stealth>=2.0.0",
         "pandas>=2.0.0",
+        "ddgs>=9.0.0",
     ],
     python_requires=">=3.10",
 )
